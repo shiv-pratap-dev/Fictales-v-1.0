@@ -4,3 +4,15 @@ pillow
 img2pdf
 python-dotenv
 # optional for FastAPI: fastapi, uvicorn[standard]
+fastapi
+uvicorn
+boto3
+easyocr
+numpy
+
+
+
+
+
+
+
