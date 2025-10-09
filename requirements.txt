@@ -1,14 +1,33 @@
-replicate
-requests
-pillow
-img2pdf
-python-dotenv
-# optional for FastAPI: fastapi, uvicorn[standard]
+# Web framework & ASGI server
 fastapi
-uvicorn
-boto3
-easyocr
+uvicorn[standard]
+
+# Async file I/O used by FastAPI endpoints
+aiofiles
+
+# Env loader
+python-dotenv
+
+# HTTP clients
+httpx>=0.21.0,<1
+requests
+
+# Image processing / PDF assembly
+Pillow
 numpy
+img2pdf
+pikepdf
+
+# Cloud/storage / SDKs
+boto3
+
+# OCR (note: heavy; may require more memory)
+easyocr
+
+# Optional: replicate client if you use replicate for model serving
+replicate
+
+
 
 
 
