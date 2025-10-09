@@ -1,0 +1,6 @@
+replicate
+requests
+pillow
+img2pdf
+python-dotenv
+# optional for FastAPI: fastapi, uvicorn[standard]
