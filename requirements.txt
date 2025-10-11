@@ -1,4 +1,4 @@
-# requirements.txt — Fictales Railway Backend (optimized)
+# requirements.txt — Fictales Railway Backend (updated)
 # force rebuild 2025-10-11
 
 fastapi==0.115.0
@@ -19,19 +19,14 @@ boto3==1.35.18
 Pillow==10.4.0
 fpdf==1.7.2
 numpy==1.26.4
-img2pdf==0.4.7
-pikepdf==12.2.0
+img2pdf==0.6.1
+# pikepdf removed because it requires system qpdf; add later if you install qpdf in the build image
 
-# OCR (optional — heavy; remove if you want very small, fast builds)
-easyocr==1.7.1
+# OCR (optional — heavy; lazy-load in code)
+easyocr==1.7.2
 
-# Optional model serving client (keep if you plan to call Replicate/HF SDKs)
-replicate==0.11.0
+# Optional model serving client (include only if needed)
+# replicate==0.11.0
 
 # Data validation
 pydantic==2.10.6
-
-
-
-
-
