@@ -302,3 +302,9 @@ async def _process_pipeline(job_id: str, req: dict):
         logger.exception("[%s] unexpected error in pipeline: %s", job_id, exc)
         _jobs[job_id].update(status="failed", error=str(exc))
         return
+
+# --- Add this at the bottom of app/main.py (optional but safe) ---
+if __name__ == "__main__":
+    import uvicorn, os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
