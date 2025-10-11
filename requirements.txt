@@ -1,32 +1,11 @@
-# requirements.txt — Fictales Railway Backend (updated)
+# requirements.txt — Fictales Railway backend (lightweight)
 # force rebuild 2025-10-11
 
 fastapi==0.115.0
 uvicorn[standard]==0.30.1
-
-# Async / file I/O
 aiofiles==24.1.0
 python-dotenv==1.0.1
-
-# HTTP
 httpx==0.27.2
 requests==2.31.0
-
-# Cloud / storage
 boto3==1.35.18
-
-# Image / PDF
-Pillow==10.4.0
-fpdf==1.7.2
-numpy==1.26.4
-img2pdf==0.6.1
-# pikepdf removed because it requires system qpdf; add later if you install qpdf in the build image
-
-# OCR (optional — heavy; lazy-load in code)
-easyocr==1.7.2
-
-# Optional model serving client (include only if needed)
-# replicate==0.11.0
-
-# Data validation
 pydantic==2.10.6
