@@ -31,9 +31,10 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 import boto3
 import httpx
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, Form, File
 from pydantic import BaseModel
 from botocore.client import Config
+from typing import Literal, Optional
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
@@ -204,21 +205,76 @@ async def get_presigned_upload(req: PresignRequest):
     return PresignResp(upload_url=url, r2_key=key, bucket=CF_R2_BUCKET_UPLOADS, expires_in=PRESIGN_EXPIRATION)
 
 @app.post("/generate-story")
-async def generate_story(req: GenerateRequest, background_tasks: BackgroundTasks):
-    if s3 is None or not HF_SPACE_URL:
+async def generate_story(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    kid_name: str = Form(...),
+    story_choice: Literal["story1", "story2"] = Form(...),
+    gender: Literal["boy", "girl"] = Form(...),
+    callback_url: Optional[str] = Form(None),
+    callback_secret: Optional[str] = Form(None),
+):
+    """
+    Single-step endpoint for uploads + job creation:
+    - Accepts file via Swagger / frontend form
+    - Uploads file to Cloudflare R2 (uploads bucket)
+    - Creates a job and starts background HF orchestration (_process_pipeline)
+    """
+    # Config check
+    if not (CF_ACCOUNT_ID and CF_ACCESS_KEY_ID and CF_SECRET_ACCESS_KEY and HF_SPACE_URL):
         raise HTTPException(status_code=500, detail="Server not fully configured (missing env vars)")
 
-    job_id = req.job_id or uuid.uuid4().hex
-    logger.info("Received job=%s name=%s story=%s gender=%s", job_id, req.kid_name, req.story_choice, req.gender)
+    job_id = uuid.uuid4().hex
+    logger.info("Received file-upload job=%s name=%s story=%s gender=%s", job_id, kid_name, story_choice, gender)
 
-    # init job record
-    _jobs[job_id] = {"status": "processing", "created_at": datetime.utcnow().isoformat(), "error": None, "r2_key": None}
+    # Read uploaded bytes
+    try:
+        content = await file.read()
+    except Exception as e:
+        logger.exception("[%s] failed reading uploaded file: %s", job_id, e)
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
 
-    # enqueue background orchestrator
-    background_tasks.add_task(_process_pipeline, job_id, req.dict())
+    # Prepare R2 key and upload kwargs
+    upload_key = f"uploads/{job_id}_{file.filename}"
+    if s3 is None:
+        logger.error("[%s] S3/R2 client not configured", job_id)
+        raise HTTPException(status_code=500, detail="S3/R2 client not configured on server")
+
+    put_kwargs = {"Bucket": CF_R2_BUCKET_UPLOADS, "Key": upload_key, "Body": content}
+    if file.content_type:
+        put_kwargs["ContentType"] = file.content_type
+
+    # Upload to R2
+    try:
+        s3.put_object(**put_kwargs)
+        logger.info("[%s] Uploaded input file to R2: %s", job_id, upload_key)
+    except Exception as e:
+        logger.exception("[%s] Failed uploading to R2: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Failed to upload input file to R2")
+
+    # Initialize job record
+    _jobs[job_id] = {
+        "status": "processing",
+        "created_at": datetime.utcnow().isoformat(),
+        "error": None,
+        "r2_key": None,
+    }
+
+    # Build the request dict expected by the pipeline
+    req_dict = {
+        "job_id": job_id,
+        "upload_ref": {"r2_key": upload_key, "bucket": CF_R2_BUCKET_UPLOADS},
+        "kid_name": kid_name,
+        "story_choice": story_choice,
+        "gender": gender,
+        "callback_url": callback_url,
+        "callback_secret": callback_secret,
+    }
+
+    # Kick off background orchestration
+    background_tasks.add_task(_process_pipeline, job_id, req_dict)
 
     return {"job_id": job_id, "status": "processing"}
-
 @app.get("/job-status/{job_id}", response_model=JobStatusResp)
 async def job_status(job_id: str):
     data = _jobs.get(job_id)
@@ -355,3 +411,4 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
