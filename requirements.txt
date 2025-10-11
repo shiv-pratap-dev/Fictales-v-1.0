@@ -1,33 +1,49 @@
-# Web framework & ASGI server
+# -----------------------
+# Core Web Framework
+# -----------------------
 fastapi
 uvicorn[standard]
 
-# Async file I/O used by FastAPI endpoints
+# -----------------------
+# Async Utilities
+# -----------------------
 aiofiles
-
-# Env loader
 python-dotenv
 
-# HTTP clients
-httpx>=0.21.0,<1
+# -----------------------
+# HTTP Clients
+# -----------------------
+httpx>=0.23.0,<1
 requests
 
-# Image processing / PDF assembly
-Pillow
+# -----------------------
+# Cloudflare R2 (S3-compatible)
+# -----------------------
+boto3
+
+# -----------------------
+# Image / PDF Processing
+# -----------------------
+Pillow>=9.0.0
+fpdf2
 numpy
 img2pdf
 pikepdf
 
-# Cloud/storage / SDKs
-boto3
-
-# OCR (note: heavy; may require more memory)
+# -----------------------
+# OCR (optional, heavy — used only for image text extraction)
+# -----------------------
 easyocr
 
-# Optional: replicate client if you use replicate for model serving
+# -----------------------
+# Optional: For AI model serving (Replicate / Hugging Face API)
+# -----------------------
 replicate
 
-
+# -----------------------
+# Misc utilities
+# -----------------------
+pydantic>=2.0,<3
 
 
 
