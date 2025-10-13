@@ -336,6 +336,8 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
     """
     try:
         prefix = f"{story_choice}/{gender}/"
+        logger.info("[%s] Template prefix resolved to: %s", job_id, prefix)
+
         logger.info("[%s] listing templates at %s/%s", job_id, CF_R2_BUCKET_TEMPLATES, prefix)
         try:
             keys = s3_list_keys(CF_R2_BUCKET_TEMPLATES, prefix)
@@ -436,4 +438,5 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
 
