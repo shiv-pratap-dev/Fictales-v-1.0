@@ -174,8 +174,11 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
 
     # Build a smart prompt based on kid info + template
     kid_name = kidinfo.get("kid_name", "child")
-    page_hint = template_meta.get("template_key") if template_meta else "page"
-    prompt = f"On this storybook page, replace only the name text ‘shiv’ with ‘{kid_name}’. Keep the same font, size, style, and visual effects exactly as they are. Do not modify any other part of the image."
+    prompt = (
+        f"Replace only the name text 'shiv' with '{kid_name}'. "
+        "Keep the same font, font size, color, shadow, and styling exactly as it is. "
+        "Do not change any other part of the image or its composition."
+    )
 
     payload = {
         "model": "Gemini",
@@ -183,17 +186,29 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         "input": {
             "image": f"data:image/png;base64,{image_b64}",
             "prompt": prompt
-           
         }
     }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         r = await client.post(url, headers=headers, json=payload)
-      
+
+        # --- NEW: catch credits/quota issues gracefully ---
+        if r.status_code in (400, 402) and "credit" in r.text.lower():
+            logger.error("Nano Banana credits exhausted or quota reached.")
+            raise HTTPException(
+                status_code=402,
+                detail="Nano Banana credits exhausted. Please top up and retry."
+            )
+
+        # --- Handle all other HTTP errors ---
         if r.status_code >= 400:
             logger.error(f"Nano Banana returned {r.status_code}: {r.text[:600]}")
-            raise HTTPException(status_code=502, detail=f"Nano Banana error: {r.status_code}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Nano Banana error: {r.status_code} - {r.text[:300]}"
+            )
 
+        # --- Try parsing image response ---
         try:
             j = r.json()
             if isinstance(j, dict):
@@ -203,9 +218,10 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                     resp = await client.get(j["output_url"])
                     resp.raise_for_status()
                     return resp.content
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to parse Nano Banana JSON: {e}")
 
+        # fallback raw
         return r.content
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
@@ -453,6 +469,7 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
 
 
 
