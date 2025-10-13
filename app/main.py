@@ -1,19 +1,36 @@
 # app/main.py
 """
-Fictales Railway core (updated env var names to avoid collisions)
+Fictales Railway core (finalized)
 
-Key env changes:
-- Face-swap (existing, keep as-is):   PIAPI_URL, PIAPI_KEY
-- Text-swap (new separate account):   TEXT_PIAPI_URL, TEXT_PIAPI_KEY
-- Optional old face-swap service (fallback): DZINE_URL (kept as optional)
+This file:
+- Separates text-swap and face-swap PiAPI accounts
+  - TEXT_PIAPI_URL / TEXT_PIAPI_KEY -> used with model "Qubico/flux1-dev" (text swap)
+  - PIAPI_URL / PIAPI_KEY -> used with model "Qubico/image-toolkit" (face-swap)
+- Keeps Cloudflare R2 S3-style integration for uploads/templates/outputs
+- Pipeline:
+  1) list templates (templates/{story_choice}/001.png ...)
+  2) call TEXT_PIAPI (img2img, flux1-dev) per page -> text-swapped image
+  3) call PIAPI (img2img, image-toolkit) per page -> face-swapped image
+  4) upload sequential images to outputs and assemble final PDF once
+- Endpoints:
+  - POST /get-presigned-upload
+  - POST /generate-story
+  - GET  /job-status/{job_id}
+  - GET  /health
 
-Other ENV expected (same as before):
+ENV you must set in Railway:
 - CF_ACCOUNT_ID
-- CF_R2_BUCKET_UPLOADS (default: fictales-uploads)
-- CF_R2_BUCKET_OUTPUTS (default: fictales-outputs)
-- CF_R2_BUCKET_TEMPLATES (default: fictales-templates)
-- CF_ACCESS_KEY_ID / CF_SECRET_ACCESS_KEY
-- PRESIGN_EXPIRATION (optional)
+- CF_ACCESS_KEY_ID
+- CF_SECRET_ACCESS_KEY
+- CF_R2_BUCKET_UPLOADS (default fictales-uploads)
+- CF_R2_BUCKET_OUTPUTS (default fictales-outputs)
+- CF_R2_BUCKET_TEMPLATES (default fictales-templates)
+- TEXT_PIAPI_URL
+- TEXT_PIAPI_KEY
+- PIAPI_URL
+- PIAPI_KEY
+- (optional) DZINE_URL
+- PRESIGN_EXPIRATION
 """
 import os
 import uuid
@@ -44,15 +61,15 @@ CF_R2_BUCKET_TEMPLATES = os.getenv("CF_R2_BUCKET_TEMPLATES", "fictales-templates
 CF_ACCESS_KEY_ID = os.getenv("CF_ACCESS_KEY_ID")
 CF_SECRET_ACCESS_KEY = os.getenv("CF_SECRET_ACCESS_KEY")
 
-# FACE-SWAP service (keep these exact names)
-PIAPI_URL = os.getenv("PIAPI_URL")       # <-- Face-swap PiAPI (existing account)
+# FACE-SWAP service (existing account)
+PIAPI_URL = os.getenv("PIAPI_URL")
 PIAPI_KEY = os.getenv("PIAPI_KEY")
 
-# TEXT-SWAP service (NEW names to avoid collision)
-TEXT_PIAPI_URL = os.getenv("TEXT_PIAPI_URL")   # <-- Text-swap PiAPI (separate account)
+# TEXT-SWAP service (separate account)
+TEXT_PIAPI_URL = os.getenv("TEXT_PIAPI_URL")
 TEXT_PIAPI_KEY = os.getenv("TEXT_PIAPI_KEY")
 
-# Optional legacy / alternative face-swap endpoint (kept as fallback; if set, may be used instead)
+# Optional fallback
 DZINE_URL = os.getenv("DZINE_URL")
 
 PRESIGN_EXPIRATION = int(os.getenv("PRESIGN_EXPIRATION", "3600"))
@@ -78,7 +95,7 @@ else:
     logger.warning("R2 not fully configured (endpoint or creds missing).")
 
 # ---------- app ----------
-app = FastAPI(title="FictalesRailwayCore (Separated PiAPI envs)")
+app = FastAPI(title="FictalesRailwayCore (Final)")
 
 # simple in-memory job store (replace with persistent store for prod)
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -156,25 +173,37 @@ def natural_sort_key(name: str):
     # fallback
     return base
 
-# ---------- external API helpers ----------
+# ---------- external API helpers (with models hardcoded) ----------
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
-    Call TEXT_PIAPI (separate account) to do text swap on a single image.
+    Call TEXT_PIAPI (Flux1-Dev) to do text swap on a single image.
     Uses TEXT_PIAPI_URL and TEXT_PIAPI_KEY.
-    Contract assumed: returns JSON with "image_b64" or direct bytes.
+    Model used: Qubico/flux1-dev
+    Task: img2img
     """
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
     headers = {"Authorization": f"Bearer {TEXT_PIAPI_KEY}"} if TEXT_PIAPI_KEY else {}
-    data = {"kidinfo": json.dumps(kidinfo)}
-    if template_meta:
-        data["template_meta"] = json.dumps(template_meta)
 
+    # Flux contract: include model + task_type + inputs; adapt if your TEXT_PIAPI expects different fields
+    data = {
+        "model": "Qubico/flux1-dev",
+        "task_type": "img2img",
+        "input": {
+            # include any other parameters your TEXT_PIAPI expects (strength, seed, etc.)
+            # we include kidinfo and template_meta as metadata
+            "kidinfo": kidinfo,
+            "template_meta": template_meta or {},
+        },
+    }
+
+    # If the service expects JSON body with image as base64, adjust. Here we send as multipart file (common).
     files = {"file": ("page.png", image_bytes, "image/png")}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(TEXT_PIAPI_URL, headers=headers, data=data, files=files)
+        r = await client.post(TEXT_PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
         r.raise_for_status()
+        # prefer JSON with image_b64 or output_url
         try:
             j = r.json()
             if isinstance(j, dict):
@@ -186,22 +215,28 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                     return resp.content
         except Exception:
             pass
+        # fallback: raw bytes
         return r.content
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
     """
-    Call PIAPI (face-swap account) to do face swapping on a single image.
+    Call PIAPI (Image-Toolkit) to do face swapping on a single image.
     Uses PIAPI_URL and PIAPI_KEY.
-    If PIAPI_URL is not set but DZINE_URL is present, it will call DZINE_URL instead.
-    If neither present, returns identity (original bytes).
+    Model used: Qubico/image-toolkit
+    Task: img2img
     """
-    # Prefer PIAPI (face-swap account)
     if PIAPI_URL:
         headers = {"Authorization": f"Bearer {PIAPI_KEY}"} if PIAPI_KEY else {}
-        data = {"meta": json.dumps(face_meta or {})}
+        data = {
+            "model": "Qubico/image-toolkit",
+            "task_type": "img2img",
+            "input": {
+                "meta": face_meta or {}
+            },
+        }
         files = {"file": ("page.png", image_bytes, "image/png")}
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(PIAPI_URL, headers=headers, data=data, files=files)
+            r = await client.post(PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
             r.raise_for_status()
             try:
                 j = r.json()
@@ -216,7 +251,7 @@ async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeo
                 pass
             return r.content
 
-    # fallback to DZINE if provided
+    # fallback to DZINE_URL if configured
     if DZINE_URL:
         headers = {}
         files = {"file": ("page.png", image_bytes, "image/png")}
@@ -255,7 +290,6 @@ async def get_presigned_upload(req: PresignRequest):
 @app.post("/generate-story")
 async def generate_story(
     background_tasks: BackgroundTasks,
-    # either user uploaded kidinfo earlier and passes upload_ref, or provides kidinfo JSON in form
     upload_ref: Optional[str] = Form(None),  # r2_key of kidinfo JSON if pre-uploaded
     kidinfo_json: Optional[str] = Form(None),  # JSON string for kidinfo (if no upload_ref)
     story_choice: str = Form(...),  # e.g. "story1" or "story2"
@@ -321,9 +355,8 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
     """
     Steps:
       1) list template images under templates/{story_choice}/
-      2) for each template image: download -> call TEXT_PIAPI for text swap -> save swapped image
-      3) call PIAPI (face-swap account) per image -> save final images
-      4) assemble final PDF from final images and upload to outputs/{job_id}/{job_id}.pdf
+      2) for each template image: download -> call TEXT_PIAPI for text swap -> call PIAPI for face-swap
+      3) save final images (sequential) to outputs and assemble final PDF once
     """
     try:
         prefix = f"{story_choice}/"
@@ -355,7 +388,7 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
                 _jobs[job_id].update(status="failed", error=f"Failed downloading template {tpl_key}")
                 return
 
-            # 1) TEXT swap using TEXT_PIAPI (separate account)
+            # 1) TEXT swap (flux1-dev)
             try:
                 text_swapped_bytes = await call_text_piapi_image_swap(tpl_bytes, kidinfo, template_meta={"template_key": tpl_key, "index": idx})
             except Exception as e:
@@ -363,7 +396,7 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
                 _jobs[job_id].update(status="failed", error=f"TEXT_PIAPI text-swap failed for {tpl_key}")
                 return
 
-            # 2) FACE swap using PIAPI (face-swap account) or DZINE fallback
+            # 2) FACE swap (image-toolkit)
             try:
                 face_swapped_bytes = await call_face_piapi_swap(text_swapped_bytes, face_meta={"kidinfo_key": kidinfo_r2_key, "index": idx})
             except Exception as e:
