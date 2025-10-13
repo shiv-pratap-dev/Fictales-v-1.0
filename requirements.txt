@@ -1,12 +1,33 @@
-# requirements.txt — Fictales Railway backend (lightweight)
-# force rebuild 2025-10-11
+# ==========================================
+# Fictales Railway Backend — Final Build
+# Optimized for dual-PiAPI (Flux1-Dev + Image-Toolkit)
+# and Cloudflare R2 storage via boto3.
+# ==========================================
 
+# --- Core Framework ---
 fastapi==0.115.0
 uvicorn[standard]==0.30.1
-aiofiles==24.1.0
-python-dotenv==1.0.1
+
+# --- HTTP & Networking ---
 httpx==0.27.2
 requests==2.31.0
-boto3==1.35.18
-pydantic==2.10.6
 python-multipart==0.0.9
+aiofiles==24.1.0
+
+# --- Data & Validation ---
+pydantic==2.10.6
+python-dotenv==1.0.1
+
+# --- Cloudflare R2 / S3 Access ---
+boto3==1.35.18
+botocore==1.35.18
+
+# --- Image Handling / PDF Assembly ---
+Pillow==10.4.0
+
+# --- (Optional) Local Testing / CLI utilities ---
+# rich==13.7.1          # pretty logging (optional)
+# tqdm==4.66.5          # progress bars (optional)
+
+# --- Removed legacy heavy deps ---
+# torch, torchvision, easyocr, gradio, huggingface_hub  ❌
