@@ -158,28 +158,42 @@ def natural_sort_key(name: str):
 # ---------- external API helpers (models hardcoded) ----------
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
-    Call TEXT_PIAPI (Flux1-Dev) to do text swap on a single image.
-    Model used: Qubico/flux1-dev
+    Text-swap step using Nano Banana (Gemini) model.
+    Model: Gemini
+    Task type: gemini-2.5-flash-image
     """
+
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
-    headers = {"Authorization": f"Bearer {TEXT_PIAPI_KEY}"} if TEXT_PIAPI_KEY else {}
+    url = TEXT_PIAPI_URL.rstrip("/") + "/"  # normalize
+    headers = {"X-API-KEY": TEXT_PIAPI_KEY}
 
-    data = {
-        "model": "Qubico/flux1-dev",
-        "task_type": "img2img",
+    # Convert image to base64
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    # Build a smart prompt based on kid info + template
+    kid_name = kidinfo.get("kid_name", "child")
+    page_hint = template_meta.get("template_key") if template_meta else "page"
+    prompt = f"On this storybook page, replace only the name text ‘shiv’ with ‘{kid_name}’. Keep the same font, size, style, and visual effects exactly as they are. Do not modify any other part of the image."
+
+    payload = {
+        "model": "Gemini",
+        "task_type": "gemini-2.5-flash-image",
         "input": {
-            "kidinfo": kidinfo,
-            "template_meta": template_meta or {}
+            "image": f"data:image/png;base64,{image_b64}",
+            "prompt": prompt
+           
         }
     }
 
-    files = {"file": ("page.png", image_bytes, "image/png")}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # many PiAPI deployments accept a multipart 'payload' + file; adjust if your account expects different contract
-        r = await client.post(TEXT_PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
-        r.raise_for_status()
+        r = await client.post(url, headers=headers, json=payload)
+      
+        if r.status_code >= 400:
+            logger.error(f"Nano Banana returned {r.status_code}: {r.text[:600]}")
+            raise HTTPException(status_code=502, detail=f"Nano Banana error: {r.status_code}")
+
         try:
             j = r.json()
             if isinstance(j, dict):
@@ -191,6 +205,7 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                     return resp.content
         except Exception:
             pass
+
         return r.content
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
@@ -438,5 +453,6 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
 
 
