@@ -158,71 +158,143 @@ def natural_sort_key(name: str):
 # ---------- external API helpers (models hardcoded) ----------
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
-    Text-swap step using Nano Banana (Gemini) model.
-    Model: Gemini
-    Task type: gemini-2.5-flash-image
+    Text-swap step using PiAPI Gemini (image-to-image variant).
+    - Posts image+prompt to TEXT_PIAPI_URL (expects /api/v1/task)
+    - Polls the returned task_id until 'completed' (or fails)
+    - Returns final image bytes (decoded from image_b64 or fetched from image_urls[0])
     """
+    import asyncio
 
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
-    url = TEXT_PIAPI_URL.rstrip("/") + "/"  # normalize
+    url = TEXT_PIAPI_URL.rstrip("/") + "/"  # e.g. https://api.piapi.ai/api/v1/task/
     headers = {"X-API-KEY": TEXT_PIAPI_KEY}
 
-    # Convert image to base64
+    # convert to base64 data URI
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Build a smart prompt based on kid info + template
     kid_name = kidinfo.get("kid_name", "child")
+
     prompt = (
         f"Replace only the name text 'shiv' with '{kid_name}'. "
-        "Keep the same font, font size, color, shadow, and styling exactly as it is. "
-        "Do not change any other part of the image or its composition."
+        "Preserve the same font, font size, color, shadow, alignment, and layout exactly as it appears. "
+        "Do not modify other text or visuals."
     )
 
     payload = {
-        "model": "Gemini",
+        "model": "gemini",
         "task_type": "gemini-2.5-flash-image",
         "input": {
+            "prompt": prompt,
             "image": f"data:image/png;base64,{image_b64}",
-            "prompt": prompt
+            "num_images": 1,
+            "output_format": "png",
+            "aspect_ratio": "1:1"
         }
     }
 
+    # Use a single client for POST + polling + potential file GET
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, headers=headers, json=payload)
-
-        # --- NEW: catch credits/quota issues gracefully ---
-        if r.status_code in (400, 402) and "credit" in r.text.lower():
-            logger.error("Nano Banana credits exhausted or quota reached.")
-            raise HTTPException(
-                status_code=402,
-                detail="Nano Banana credits exhausted. Please top up and retry."
-            )
-
-        # --- Handle all other HTTP errors ---
-        if r.status_code >= 400:
-            logger.error(f"Nano Banana returned {r.status_code}: {r.text[:600]}")
-            raise HTTPException(
-                status_code=502,
-                detail=f"Nano Banana error: {r.status_code} - {r.text[:300]}"
-            )
-
-        # --- Try parsing image response ---
+        # POST the task
         try:
-            j = r.json()
-            if isinstance(j, dict):
-                if j.get("image_b64"):
-                    return base64.b64decode(j["image_b64"])
-                if j.get("output_url"):
-                    resp = await client.get(j["output_url"])
-                    resp.raise_for_status()
-                    return resp.content
+            r = await client.post(url, headers=headers, json=payload)
         except Exception as e:
-            logger.warning(f"Failed to parse Nano Banana JSON: {e}")
+            logger.exception("Failed to reach TEXT_PIAPI endpoint: %s", e)
+            raise HTTPException(status_code=502, detail="Failed to reach TEXT_PIAPI service")
 
-        # fallback raw
-        return r.content
+        # Quick checks for quota / credit issues
+        text_lower = (r.text or "").lower()
+        if r.status_code in (400, 402) and "credit" in text_lower:
+            logger.error("Nano Banana / Gemini credits exhausted or quota reached: %s", r.text[:400])
+            raise HTTPException(status_code=402, detail="Nano Banana credits exhausted. Please top up and retry.")
+
+        if r.status_code >= 400:
+            logger.error("Gemini POST returned %s: %s", r.status_code, r.text[:800])
+            raise HTTPException(status_code=502, detail=f"Gemini error: {r.status_code}")
+
+        # Parse JSON result
+        try:
+            resp = r.json()
+        except Exception as e:
+            logger.warning("Unable to parse JSON from Gemini POST response: %s", e)
+            raise HTTPException(status_code=502, detail="Invalid response from Gemini")
+
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        task_id = data.get("task_id") or ""
+        status = data.get("status") or ""
+
+        # If the model returned a completed result immediately (rare), handle it
+        if status == "completed":
+            output = data.get("output", {}) or {}
+            # image_b64 (preferred) or image_urls
+            if output.get("image_b64"):
+                return base64.b64decode(output["image_b64"])
+            urls = output.get("image_urls") or []
+            if urls:
+                resp_get = await client.get(urls[0])
+                resp_get.raise_for_status()
+                return resp_get.content
+            raise HTTPException(status_code=502, detail="Gemini returned completed status but no image found")
+
+        # Otherwise poll the task endpoint: TEXT_PIAPI_URL + /{task_id}
+        if not task_id:
+            logger.error("No task_id returned by Gemini POST: %s", resp)
+            raise HTTPException(status_code=502, detail="Gemini did not return task_id")
+
+        task_status_url = TEXT_PIAPI_URL.rstrip("/") + f"/{task_id}"
+        # Poll settings
+        poll_interval = 1.0  # seconds
+        max_poll_seconds = min(max(10, timeout), 120)  # cap polling to avoid runaway
+        max_attempts = int(max_poll_seconds / poll_interval)
+
+        for attempt in range(max_attempts):
+            await asyncio.sleep(poll_interval)
+            try:
+                r2 = await client.get(task_status_url, headers=headers)
+            except Exception as e:
+                logger.warning("[%s] Poll attempt %d failed to reach Gemini: %s", task_id, attempt + 1, e)
+                continue
+
+            # handle quota messages during poll
+            text2 = (r2.text or "").lower()
+            if r2.status_code in (400, 402) and "credit" in text2:
+                logger.error("[%s] Credits exhausted while polling: %s", task_id, r2.text[:400])
+                raise HTTPException(status_code=402, detail="Nano Banana credits exhausted during processing")
+
+            if r2.status_code >= 400:
+                logger.error("[%s] Gemini poll returned %s: %s", task_id, r2.status_code, r2.text[:800])
+                raise HTTPException(status_code=502, detail=f"Gemini poll error: {r2.status_code}")
+
+            try:
+                jr = r2.json()
+            except Exception as e:
+                logger.warning("[%s] Failed parsing Gemini poll JSON (attempt %d): %s", task_id, attempt + 1, e)
+                continue
+
+            d = jr.get("data", {}) if isinstance(jr, dict) else {}
+            st = d.get("status", "")
+            if st == "completed":
+                out = d.get("output", {}) or {}
+                if out.get("image_b64"):
+                    return base64.b64decode(out["image_b64"])
+                urls = out.get("image_urls") or []
+                if urls:
+                    resp_get = await client.get(urls[0])
+                    resp_get.raise_for_status()
+                    return resp_get.content
+                raise HTTPException(status_code=502, detail="Gemini completed but returned no image")
+            if st in ("failed", "error"):
+                logger.error("[%s] Gemini task failed: %s", task_id, jr)
+                raise HTTPException(status_code=502, detail="Gemini processing failed")
+
+            # still pending, continue loop
+            if attempt % 5 == 0:
+                logger.info("[%s] Gemini still pending (attempt %d/%d)", task_id, attempt + 1, max_attempts)
+
+        # Polling timed out
+        logger.error("[%s] Gemini task did not complete within %s seconds", task_id, max_poll_seconds)
+        raise HTTPException(status_code=504, detail="Gemini processing timed out")
+
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
     """
@@ -469,6 +541,7 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
 
 
 
