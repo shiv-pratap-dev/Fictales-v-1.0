@@ -1,36 +1,20 @@
 # app/main.py
 """
-Fictales Railway core (finalized)
+Fictales Railway core (final, UI-friendly)
 
-This file:
-- Separates text-swap and face-swap PiAPI accounts
-  - TEXT_PIAPI_URL / TEXT_PIAPI_KEY -> used with model "Qubico/flux1-dev" (text swap)
-  - PIAPI_URL / PIAPI_KEY -> used with model "Qubico/image-toolkit" (face-swap)
-- Keeps Cloudflare R2 S3-style integration for uploads/templates/outputs
-- Pipeline:
-  1) list templates (templates/{story_choice}/001.png ...)
-  2) call TEXT_PIAPI (img2img, flux1-dev) per page -> text-swapped image
-  3) call PIAPI (img2img, image-toolkit) per page -> face-swapped image
-  4) upload sequential images to outputs and assemble final PDF once
-- Endpoints:
-  - POST /get-presigned-upload
-  - POST /generate-story
-  - GET  /job-status/{job_id}
-  - GET  /health
+Generate-story UI expectations (Swagger/form):
+- file (UploadFile)        -> kid's image
+- kid_name (string)        -> text input
+- story_choice (dropdown)  -> "story1" or "story2"
+- gender (dropdown)        -> "boy" or "girl"
 
-ENV you must set in Railway:
-- CF_ACCOUNT_ID
-- CF_ACCESS_KEY_ID
-- CF_SECRET_ACCESS_KEY
-- CF_R2_BUCKET_UPLOADS (default fictales-uploads)
-- CF_R2_BUCKET_OUTPUTS (default fictales-outputs)
-- CF_R2_BUCKET_TEMPLATES (default fictales-templates)
-- TEXT_PIAPI_URL
-- TEXT_PIAPI_KEY
-- PIAPI_URL
-- PIAPI_KEY
-- (optional) DZINE_URL
-- PRESIGN_EXPIRATION
+Pipeline:
+  1) upload kid image to uploads bucket
+  2) build kidinfo = {kid_name, gender, kid_image_r2}
+  3) list templates for story_choice
+  4) per-page: text-swap (TEXT_PIAPI, Qubico/flux1-dev) -> face-swap (PIAPI, Qubico/image-toolkit)
+  5) upload sequential pages and assemble single PDF once
+  6) upload final PDF to outputs/{job_id}/{job_id}.pdf
 """
 import os
 import uuid
@@ -38,7 +22,7 @@ import json
 import logging
 import base64
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 import boto3
 from botocore.client import Config
 import httpx
@@ -95,7 +79,7 @@ else:
     logger.warning("R2 not fully configured (endpoint or creds missing).")
 
 # ---------- app ----------
-app = FastAPI(title="FictalesRailwayCore (Final)")
+app = FastAPI(title="FictalesRailwayCore (Final UI)")
 
 # simple in-memory job store (replace with persistent store for prod)
 _jobs: Dict[str, Dict[str, Any]] = {}
@@ -164,46 +148,38 @@ def s3_object_exists(bucket: str, key: str) -> bool:
         return False
 
 def natural_sort_key(name: str):
-    # sort by final filename numeric parts if possible; fallback to lexicographic
     base = os.path.basename(name)
     parts = base.split(".")[0].split("_")
     for p in reversed(parts):
         if p.isdigit():
             return int(p)
-    # fallback
     return base
 
-# ---------- external API helpers (with models hardcoded) ----------
+# ---------- external API helpers (models hardcoded) ----------
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
     Call TEXT_PIAPI (Flux1-Dev) to do text swap on a single image.
-    Uses TEXT_PIAPI_URL and TEXT_PIAPI_KEY.
     Model used: Qubico/flux1-dev
-    Task: img2img
     """
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
     headers = {"Authorization": f"Bearer {TEXT_PIAPI_KEY}"} if TEXT_PIAPI_KEY else {}
 
-    # Flux contract: include model + task_type + inputs; adapt if your TEXT_PIAPI expects different fields
     data = {
         "model": "Qubico/flux1-dev",
         "task_type": "img2img",
         "input": {
-            # include any other parameters your TEXT_PIAPI expects (strength, seed, etc.)
-            # we include kidinfo and template_meta as metadata
             "kidinfo": kidinfo,
-            "template_meta": template_meta or {},
-        },
+            "template_meta": template_meta or {}
+        }
     }
 
-    # If the service expects JSON body with image as base64, adjust. Here we send as multipart file (common).
     files = {"file": ("page.png", image_bytes, "image/png")}
     async with httpx.AsyncClient(timeout=timeout) as client:
+        # many PiAPI deployments accept a multipart 'payload' + file; adjust if your account expects different contract
         r = await client.post(TEXT_PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
         r.raise_for_status()
-        # prefer JSON with image_b64 or output_url
         try:
             j = r.json()
             if isinstance(j, dict):
@@ -215,15 +191,12 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                     return resp.content
         except Exception:
             pass
-        # fallback: raw bytes
         return r.content
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
     """
     Call PIAPI (Image-Toolkit) to do face swapping on a single image.
-    Uses PIAPI_URL and PIAPI_KEY.
     Model used: Qubico/image-toolkit
-    Task: img2img
     """
     if PIAPI_URL:
         headers = {"Authorization": f"Bearer {PIAPI_KEY}"} if PIAPI_KEY else {}
@@ -232,7 +205,7 @@ async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeo
             "task_type": "img2img",
             "input": {
                 "meta": face_meta or {}
-            },
+            }
         }
         files = {"file": ("page.png", image_bytes, "image/png")}
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -290,47 +263,50 @@ async def get_presigned_upload(req: PresignRequest):
 @app.post("/generate-story")
 async def generate_story(
     background_tasks: BackgroundTasks,
-    upload_ref: Optional[str] = Form(None),  # r2_key of kidinfo JSON if pre-uploaded
-    kidinfo_json: Optional[str] = Form(None),  # JSON string for kidinfo (if no upload_ref)
-    story_choice: str = Form(...),  # e.g. "story1" or "story2"
-    gender: str = Form(...),
+    file: UploadFile = File(...),  # kid image
+    kid_name: str = Form(...),     # text input
+    story_choice: Literal["story1", "story2"] = Form(...),  # dropdown
+    gender: Literal["boy", "girl"] = Form(...),             # dropdown
 ):
+    """
+    Accepts kid image + kid_name + story_choice + gender.
+    Uploads kid image to uploads bucket, constructs kidinfo, and starts pipeline.
+    """
     if s3 is None:
         raise HTTPException(status_code=500, detail="Server storage not configured")
 
     job_id = uuid.uuid4().hex
-    logger.info("Creating job %s for story=%s gender=%s", job_id, story_choice, gender)
+    logger.info("Creating job %s for story=%s gender=%s kid=%s", job_id, story_choice, gender, kid_name)
 
-    kidinfo = None
-    kidinfo_r2_key = None
+    # read file
+    try:
+        content = await file.read()
+    except Exception as e:
+        logger.exception("[%s] failed reading uploaded file: %s", job_id, e)
+        raise HTTPException(status_code=400, detail="Failed to read uploaded file")
 
-    if upload_ref:
-        kidinfo_r2_key = upload_ref
-        if not s3_object_exists(CF_R2_BUCKET_UPLOADS, kidinfo_r2_key):
-            raise HTTPException(status_code=400, detail="Provided upload_ref not found in uploads bucket")
-        try:
-            raw = s3_get_bytes(CF_R2_BUCKET_UPLOADS, kidinfo_r2_key)
-            kidinfo = json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            logger.exception("Failed reading kidinfo from R2: %s", e)
-            raise HTTPException(status_code=500, detail="Failed to read kidinfo from R2")
-    elif kidinfo_json:
-        try:
-            kidinfo = json.loads(kidinfo_json)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail="kidinfo_json invalid JSON")
-        kidinfo_r2_key = f"uploads/kidinfo_{job_id}.json"
-        try:
-            s3_put_bytes(CF_R2_BUCKET_UPLOADS, kidinfo_r2_key, json.dumps(kidinfo).encode("utf-8"), content_type="application/json")
-            logger.info("[%s] uploaded kidinfo -> %s", job_id, kidinfo_r2_key)
-        except Exception as e:
-            logger.exception("[%s] failed uploading kidinfo: %s", job_id, e)
-            raise HTTPException(status_code=500, detail="Failed to upload kidinfo to R2")
-    else:
-        raise HTTPException(status_code=400, detail="Either upload_ref or kidinfo_json must be provided")
+    # upload kid image to uploads bucket
+    upload_key = f"uploads/{job_id}_kid_{file.filename.replace(' ', '_')}"
+    try:
+        s3_put_bytes(CF_R2_BUCKET_UPLOADS, upload_key, content, content_type=file.content_type or "image/png")
+        logger.info("[%s] uploaded kid image to R2: %s", job_id, upload_key)
+    except Exception as e:
+        logger.exception("[%s] Failed uploading kid image to R2: %s", job_id, e)
+        raise HTTPException(status_code=500, detail="Failed to upload kid image to R2")
 
+    # build kidinfo
+    kidinfo = {
+        "kid_name": kid_name,
+        "gender": gender,
+        "kid_image_r2": {"bucket": CF_R2_BUCKET_UPLOADS, "r2_key": upload_key}
+    }
+
+    # create job record
     _jobs[job_id] = {"status": "processing", "created_at": datetime.utcnow().isoformat(), "error": None, "r2_key": None}
-    background_tasks.add_task(_process_pipeline, job_id, kidinfo_r2_key, kidinfo, story_choice, gender)
+
+    # start background pipeline
+    background_tasks.add_task(_process_pipeline, job_id, upload_key, kidinfo, story_choice, gender)
+
     return {"job_id": job_id, "status": "processing"}
 
 @app.get("/job-status/{job_id}")
