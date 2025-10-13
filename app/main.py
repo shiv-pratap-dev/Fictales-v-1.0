@@ -169,7 +169,10 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
     url = TEXT_PIAPI_URL.rstrip("/") + "/"  # e.g. https://api.piapi.ai/api/v1/task/
-    headers = {"X-API-KEY": TEXT_PIAPI_KEY}
+    headers = {"X-API-KEY": TEXT_PIAPI_KEY, 
+               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Fictales/1.0 (compatible; Python; FastAPI)",
+                "Accept": "application/json",
+                "Connection": "keep-alive"}
 
     # convert to base64 data URI
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -541,6 +544,7 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
 
 
 
