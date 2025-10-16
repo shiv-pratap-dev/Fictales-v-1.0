@@ -203,9 +203,12 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         }
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout , follow_redirects=True) as client:
         try:
             r = await client.post(url, headers=headers, json=payload)
+            if r.status_code in (301, 302, 303, 307, 308):
+               logger.warning(f"Redirected to: {r.headers.get('Location')}")
+
         except Exception as e:
             logger.exception("Failed to reach TEXT_PIAPI endpoint: %s", e)
             raise HTTPException(status_code=502, detail="Failed to reach TEXT_PIAPI service")
@@ -575,3 +578,4 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
