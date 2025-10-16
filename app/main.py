@@ -8,13 +8,15 @@ Generate-story UI expectations (Swagger/form):
 - story_choice (dropdown)  -> "story1" or "story2"
 - gender (dropdown)        -> "boy" or "girl"
 
-Pipeline:
+Pipeline (5-page check build):
   1) upload kid image to uploads bucket
   2) build kidinfo = {kid_name, gender, kid_image_r2}
-  3) list templates for story_choice
-  4) per-page: text-swap (TEXT_PIAPI, Qubico/flux1-dev) -> face-swap (PIAPI, Qubico/image-toolkit)
-  5) upload sequential pages and assemble single PDF once
-  6) upload final PDF to outputs/{job_id}/{job_id}.pdf
+  3) list templates for story_choice (cap to 5 pages)
+  4) PHASE A: per-page text-swap for first 5 pages -> store temp results
+     (after all 5 text-swaps) -> LOG checkpoint and proceed
+  5) PHASE B: per-page face-swap over text-swapped results
+  6) upload sequential pages and assemble single PDF once
+  7) upload final PDF to outputs/{job_id}/{job_id}.pdf
 """
 import os
 import uuid
@@ -155,6 +157,10 @@ def natural_sort_key(name: str):
             return int(p)
     return base
 
+def is_image_key(key: str) -> bool:
+    lower = key.lower()
+    return lower.endswith(".png") or lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".webp")
+
 # ---------- external API helpers (models hardcoded) ----------
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
@@ -168,13 +174,14 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
 
-    url = TEXT_PIAPI_URL.rstrip("/") + "/"  # e.g. https://api.piapi.ai/api/v1/task/
-    headers = {"X-API-KEY": TEXT_PIAPI_KEY, 
-               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Fictales/1.0 (compatible; Python; FastAPI)",
-                "Accept": "application/json",
-                "Connection": "keep-alive"}
+    url = TEXT_PIAPI_URL.rstrip("/") + "/"
+    headers = {
+        "X-API-KEY": TEXT_PIAPI_KEY,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Fictales/1.0 (compatible; Python; FastAPI)",
+        "Accept": "application/json",
+        "Connection": "keep-alive"
+    }
 
-    # convert to base64 data URI
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     kid_name = kidinfo.get("kid_name", "child")
 
@@ -196,16 +203,13 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         }
     }
 
-    # Use a single client for POST + polling + potential file GET
     async with httpx.AsyncClient(timeout=timeout) as client:
-        # POST the task
         try:
             r = await client.post(url, headers=headers, json=payload)
         except Exception as e:
             logger.exception("Failed to reach TEXT_PIAPI endpoint: %s", e)
             raise HTTPException(status_code=502, detail="Failed to reach TEXT_PIAPI service")
 
-        # Quick checks for quota / credit issues
         text_lower = (r.text or "").lower()
         if r.status_code in (400, 402) and "credit" in text_lower:
             logger.error("Nano Banana / Gemini credits exhausted or quota reached: %s", r.text[:400])
@@ -215,7 +219,6 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
             logger.error("Gemini POST returned %s: %s", r.status_code, r.text[:800])
             raise HTTPException(status_code=502, detail=f"Gemini error: {r.status_code}")
 
-        # Parse JSON result
         try:
             resp = r.json()
         except Exception as e:
@@ -226,10 +229,8 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         task_id = data.get("task_id") or ""
         status = data.get("status") or ""
 
-        # If the model returned a completed result immediately (rare), handle it
         if status == "completed":
             output = data.get("output", {}) or {}
-            # image_b64 (preferred) or image_urls
             if output.get("image_b64"):
                 return base64.b64decode(output["image_b64"])
             urls = output.get("image_urls") or []
@@ -239,15 +240,13 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                 return resp_get.content
             raise HTTPException(status_code=502, detail="Gemini returned completed status but no image found")
 
-        # Otherwise poll the task endpoint: TEXT_PIAPI_URL + /{task_id}
         if not task_id:
             logger.error("No task_id returned by Gemini POST: %s", resp)
             raise HTTPException(status_code=502, detail="Gemini did not return task_id")
 
         task_status_url = TEXT_PIAPI_URL.rstrip("/") + f"/{task_id}"
-        # Poll settings
-        poll_interval = 1.0  # seconds
-        max_poll_seconds = min(max(10, timeout), 120)  # cap polling to avoid runaway
+        poll_interval = 1.0
+        max_poll_seconds = min(max(10, timeout), 120)
         max_attempts = int(max_poll_seconds / poll_interval)
 
         for attempt in range(max_attempts):
@@ -258,7 +257,6 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                 logger.warning("[%s] Poll attempt %d failed to reach Gemini: %s", task_id, attempt + 1, e)
                 continue
 
-            # handle quota messages during poll
             text2 = (r2.text or "").lower()
             if r2.status_code in (400, 402) and "credit" in text2:
                 logger.error("[%s] Credits exhausted while polling: %s", task_id, r2.text[:400])
@@ -290,11 +288,9 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                 logger.error("[%s] Gemini task failed: %s", task_id, jr)
                 raise HTTPException(status_code=502, detail="Gemini processing failed")
 
-            # still pending, continue loop
             if attempt % 5 == 0:
                 logger.info("[%s] Gemini still pending (attempt %d/%d)", task_id, attempt + 1, max_attempts)
 
-        # Polling timed out
         logger.error("[%s] Gemini task did not complete within %s seconds", task_id, max_poll_seconds)
         raise HTTPException(status_code=504, detail="Gemini processing timed out")
 
@@ -432,13 +428,17 @@ async def job_status(job_id: str):
 async def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
 
-# ---------- background pipeline ----------
+# ---------- background pipeline (two-phase: text then face) ----------
 async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, story_choice: str, gender: str):
     """
     Steps:
-      1) list template images under templates/{story_choice}/
-      2) for each template image: download -> call TEXT_PIAPI for text swap -> call PIAPI for face-swap
-      3) save final images (sequential) to outputs and assemble final PDF once
+      A) list template images under templates/{story_choice}/{gender}/ (cap to 5)
+         for each: download -> TEXT_PIAPI text-swap
+         store text-swapped bytes locally and (optionally) in outputs/tmp/
+         AFTER all 5 text-swaps, emit checkpoint log line.
+      B) run FACE swap over the 5 text-swapped images
+         upload final pages to outputs/{job_id}/NNN.png
+      C) assemble final PDF once and upload
     """
     try:
         prefix = f"{story_choice}/{gender}/"
@@ -452,19 +452,26 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
             _jobs[job_id].update(status="failed", error="Failed listing template files")
             return
 
-        if not keys:
-            msg = f"No templates found for {story_choice} in templates bucket"
+        # Filter to images and natural sort
+        image_keys = [k for k in keys if is_image_key(k)]
+        if not image_keys:
+            msg = f"No image templates found for {story_choice}/{gender} in templates bucket"
             logger.error("[%s] %s", job_id, msg)
             _jobs[job_id].update(status="failed", error=msg)
             return
+        keys_sorted = sorted(image_keys, key=lambda k: natural_sort_key(k))
 
-        keys_sorted = sorted(keys, key=lambda k: natural_sort_key(k))
+        # Cap to 5 pages for this checkpoint build
+        keys_sorted = keys_sorted[:5]
+        logger.info("[%s] using first %d template pages", job_id, len(keys_sorted))
+
         tmp_dir = f"/tmp/fictales_{job_id}"
         os.makedirs(tmp_dir, exist_ok=True)
-        final_image_paths = []
 
+        # ---------- PHASE A: TEXT-SWAP ALL 5 PAGES ----------
+        text_swapped_list: List[tuple[str, bytes]] = []
         for idx, tpl_key in enumerate(keys_sorted, start=1):
-            logger.info("[%s] processing template %s", job_id, tpl_key)
+            logger.info("[%s] [TEXT] downloading template %s", job_id, tpl_key)
             try:
                 tpl_bytes = s3_get_bytes(CF_R2_BUCKET_TEMPLATES, tpl_key)
             except Exception as e:
@@ -472,23 +479,47 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
                 _jobs[job_id].update(status="failed", error=f"Failed downloading template {tpl_key}")
                 return
 
-            # 1) TEXT swap (flux1-dev)
             try:
-                text_swapped_bytes = await call_text_piapi_image_swap(tpl_bytes, kidinfo, template_meta={"template_key": tpl_key, "index": idx})
+                text_swapped_bytes = await call_text_piapi_image_swap(
+                    tpl_bytes, kidinfo, template_meta={"template_key": tpl_key, "index": idx}
+                )
             except Exception as e:
                 logger.exception("[%s] TEXT_PIAPI text-swap failed for %s: %s", job_id, tpl_key, e)
                 _jobs[job_id].update(status="failed", error=f"TEXT_PIAPI text-swap failed for {tpl_key}")
                 return
 
-            # 2) FACE swap (image-toolkit)
+            page_num = str(idx).zfill(3)
+            # Save interim text-swapped file locally (and optionally to R2 tmp path)
+            text_local_path = os.path.join(tmp_dir, f"text_{page_num}.png")
+            with open(text_local_path, "wb") as f:
+                f.write(text_swapped_bytes)
+            text_swapped_list.append((page_num, text_swapped_bytes))
+
+            # Optional: upload interim text-swapped page (helps debugging)
             try:
-                face_swapped_bytes = await call_face_piapi_swap(text_swapped_bytes, face_meta={"kidinfo_key": kidinfo_r2_key, "index": idx})
+                tmp_r2_key = f"outputs/{job_id}/_textswap/{page_num}.png"
+                s3_put_bytes(CF_R2_BUCKET_OUTPUTS, tmp_r2_key, text_swapped_bytes, content_type="image/png")
+                logger.info("[%s] uploaded interim text-swapped -> %s", job_id, tmp_r2_key)
             except Exception as e:
-                logger.exception("[%s] face-swap failed for page %s: %s", job_id, idx, e)
-                _jobs[job_id].update(status="failed", error=f"Face-swap failed for page {idx}")
+                logger.warning("[%s] failed uploading interim text page (non-fatal): %s", job_id, e)
+
+        # >>>>>>> REQUIRED CHECKPOINT LOG <<<<<<<
+        logger.info('done with all 5 page text swaps, moving on to face swaps now, pls wait')
+
+        # ---------- PHASE B: FACE-SWAP OVER TEXT-SWAPPED RESULTS ----------
+        final_image_paths: List[str] = []
+        for page_num, text_swapped_bytes in text_swapped_list:
+            idx = int(page_num)
+            try:
+                face_swapped_bytes = await call_face_piapi_swap(
+                    text_swapped_bytes,
+                    face_meta={"kidinfo_key": kidinfo_r2_key, "index": idx}
+                )
+            except Exception as e:
+                logger.exception("[%s] face-swap failed for page %s: %s", job_id, page_num, e)
+                _jobs[job_id].update(status="failed", error=f"Face-swap failed for page {page_num}")
                 return
 
-            page_num = str(idx).zfill(3)
             local_path = os.path.join(tmp_dir, f"{page_num}.png")
             with open(local_path, "wb") as f:
                 f.write(face_swapped_bytes)
@@ -497,13 +528,13 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
             r2_out_key = f"outputs/{job_id}/{page_num}.png"
             try:
                 s3_put_bytes(CF_R2_BUCKET_OUTPUTS, r2_out_key, face_swapped_bytes, content_type="image/png")
-                logger.info("[%s] uploaded page -> %s", job_id, r2_out_key)
+                logger.info("[%s] uploaded final page -> %s", job_id, r2_out_key)
             except Exception as e:
                 logger.exception("[%s] failed uploading page to outputs: %s", job_id, e)
                 _jobs[job_id].update(status="failed", error="Failed uploading page image to outputs")
                 return
 
-        # assemble PDF once
+        # ---------- PHASE C: ASSEMBLE PDF ONCE ----------
         pdf_path = os.path.join(tmp_dir, f"{job_id}.pdf")
         try:
             images = []
@@ -544,9 +575,3 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
-
-
-
-
-
-
