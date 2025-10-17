@@ -8,30 +8,31 @@ Generate-story UI expectations (Swagger/form):
 - story_choice (dropdown)  -> "story1" or "story2"
 - gender (dropdown)        -> "boy" or "girl"
 
-Pipeline (5-page check build):
+Pipeline (5-page checkpoint build, preview-first):
   1) upload kid image to uploads bucket
   2) build kidinfo = {kid_name, gender, kid_image_r2}
   3) list templates for story_choice (cap to 5 pages)
-  4) PHASE A: per-page text-swap for first 5 pages -> store temp results
-     (after all 5 text-swaps) -> LOG checkpoint and proceed
-  5) PHASE B: per-page face-swap over text-swapped results
-  6) upload sequential pages and assemble single PDF once
-  7) upload final PDF to outputs/{job_id}/{job_id}.pdf
+  4) For each template:
+       - text-swap (TEXT_PIAPI or DZINE) with retries + validation
+       - if page <= 3: face-swap immediately, upload preview
+       - else: store for face-swap pass later
+  5) after all face-swaps: upload pages, assemble PDF, upload final PDF
 """
 import os
 import uuid
 import json
 import logging
 import base64
+import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List, Literal, Tuple
 import boto3
 from botocore.client import Config
 import httpx
 from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from io import BytesIO
 
 # ---------- logging ----------
@@ -55,7 +56,7 @@ PIAPI_KEY = os.getenv("PIAPI_KEY")
 TEXT_PIAPI_URL = os.getenv("TEXT_PIAPI_URL")
 TEXT_PIAPI_KEY = os.getenv("TEXT_PIAPI_KEY")
 
-# Optional fallback
+# Optional fallback (Dzine)
 DZINE_URL = os.getenv("DZINE_URL")
 
 PRESIGN_EXPIRATION = int(os.getenv("PRESIGN_EXPIRATION", "3600"))
@@ -161,16 +162,24 @@ def is_image_key(key: str) -> bool:
     lower = key.lower()
     return lower.endswith(".png") or lower.endswith(".jpg") or lower.endswith(".jpeg") or lower.endswith(".webp")
 
+def is_valid_image_bytes(b: bytes) -> bool:
+    """Return True if bytes represent a valid/openable image."""
+    try:
+        with Image.open(BytesIO(b)) as img:
+            img.verify()  # will raise if not a valid image
+        return True
+    except Exception:
+        return False
+
 # ---------- external API helpers (models hardcoded) ----------
+# NOTE: keep these functions as "dumb" callers — we will wrap them with safety wrappers
 async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
     """
     Text-swap step using PiAPI Gemini (image-to-image variant).
-    - Posts image+prompt to TEXT_PIAPI_URL (expects /api/v1/task)
-    - Polls the returned task_id until 'completed' (or fails)
-    - Returns final image bytes (decoded from image_b64 or fetched from image_urls[0])
-    - Retries transient 5xx errors and falls back to DZINE_URL or original image if needed
+    This function attempts the primary PiAPI flow and returns raw bytes (which may be non-image).
+    Higher-level wrapper 'safe_text_swap' will validate and retry as needed.
     """
-    import asyncio, time
+    import asyncio
 
     if not TEXT_PIAPI_URL:
         raise RuntimeError("TEXT_PIAPI_URL not configured")
@@ -178,12 +187,12 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
     url = TEXT_PIAPI_URL.rstrip("/") + "/"
     headers = {
         "X-API-KEY": TEXT_PIAPI_KEY,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Fictales/1.0 (compatible; Python; FastAPI)",
+        "User-Agent": "Fictales/1.0 (FastAPI client)",
         "Accept": "application/json",
         "Connection": "keep-alive"
     }
 
-    image_b64_payload = base64.b64encode(image_bytes).decode("utf-8")
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
     kid_name = kidinfo.get("kid_name", "child")
 
     prompt = (
@@ -197,114 +206,56 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
         "task_type": "gemini-2.5-flash-image",
         "input": {
             "prompt": prompt,
-            "image": f"data:image/png;base64,{image_b64_payload}",
+            "image": f"data:image/png;base64,{image_b64}",
             "num_images": 1,
             "output_format": "png",
             "aspect_ratio": "1:1"
         }
     }
 
-    # Primary attempt with retries on transient 5xx (Cloudflare / origin flakiness)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # primary POST
+        r = None
         try:
             r = await client.post(url, headers=headers, json=payload)
-            # helpful debug if redirected
             if r.status_code in (301, 302, 303, 307, 308):
-               logger.warning("%s TEXT API redirected to: %s", repr(template_meta), r.headers.get('Location'))
+               logger.info("%s TEXT API redirected to: %s", repr(template_meta), r.headers.get('Location'))
         except Exception as e:
-            logger.exception("Failed to reach TEXT_PIAPI endpoint: %s", e)
-            # Attempt fallback provider (DZINE) below before failing completely
-
+            logger.warning("[%s] TEXT_PIAPI POST failed: %s", repr(template_meta), e)
             r = None
 
-        # --- retry transient 5xx (esp. Cloudflare 502) ---
-        if r is not None:
-            for attempt in range(3):
-                if r.status_code >= 500:
-                    logger.warning("[%s] PiAPI returned %s, retry %d/3 ...", repr(template_meta), r.status_code, attempt + 1)
-                    await asyncio.sleep(2 * (attempt + 1))  # simple backoff
-                    try:
-                        r = await client.post(url, headers=headers, json=payload)
-                    except Exception as e:
-                        logger.warning("[%s] retry attempt %d failed to reach TEXT_PIAPI: %s", repr(template_meta), attempt+1, e)
-                        r = None
-                        break
-                else:
-                    break
-        # --- end retry block ---
-
-        # If still no response or final 5xx, attempt DZINE fallback (if configured)
-        if r is None or (r.status_code >= 500):
-            if DZINE_URL:
-                logger.info("[%s] Falling back to DZINE_URL for text-swap", repr(template_meta))
-                try:
-                    # DZINE expects form upload; adapt to its expected interface
-                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as dz_client:
-                        files = {"file": ("page.png", image_bytes, "image/png")}
-                        data = {"meta": json.dumps({"prompt": prompt, "num_images": 1})}
-                        dz_r = await dz_client.post(DZINE_URL, data=data, files=files)
-                        if dz_r.status_code >= 400:
-                            logger.error("[%s] DZINE fallback returned %s", repr(template_meta), dz_r.status_code)
-                        else:
-                            try:
-                                j = dz_r.json()
-                                # prefer base64
-                                if isinstance(j, dict):
-                                    if j.get("image_b64"):
-                                        return base64.b64decode(j["image_b64"])
-                                    if j.get("output_url"):
-                                        resp_get = await dz_client.get(j["output_url"])
-                                        resp_get.raise_for_status()
-                                        return resp_get.content
-                            except Exception:
-                                # if DZINE returns raw image bytes
-                                return dz_r.content
-                except Exception as e:
-                    logger.exception("[%s] DZINE fallback failed: %s", repr(template_meta), e)
-
-            # final degraded fallback: return original template bytes (so pipeline continues)
-            logger.error("[%s] Both TEXT_PIAPI and fallback failed; returning original image bytes to avoid job failure.", repr(template_meta))
-            return image_bytes
-
-        # At this point we have a response 'r' from primary that should be JSON (or completed)
-        text_lower = (r.text or "").lower()
-        if r.status_code in (400, 402) and "credit" in text_lower:
-            logger.error("Nano Banana / Gemini credits exhausted or quota reached: %s", (r.text or "")[:400])
-            raise HTTPException(status_code=402, detail="Nano Banana credits exhausted. Please top up and retry.")
-
+        # return raw bytes only if we can (the caller will validate)
+        if r is None:
+            raise HTTPException(status_code=502, detail="TEXT_PIAPI not reachable")
+        # handle immediate non-JSON (like redirects to HTML error pages)
         if r.status_code >= 400:
-            logger.error("Gemini POST returned %s: %s", r.status_code, (r.text or "")[:800])
-            raise HTTPException(status_code=502, detail=f"Gemini error: {r.status_code}")
+            raise HTTPException(status_code=502, detail=f"Gemini POST returned {r.status_code}")
 
+        # If Gemini returns an immediate completed response in JSON, attempt to pull image
         try:
             resp = r.json()
-        except Exception as e:
-            logger.warning("Unable to parse JSON from Gemini POST response: %s", e)
-            raise HTTPException(status_code=502, detail="Invalid response from Gemini")
+        except Exception:
+            # non-json (or empty) - return raw content to be validated by caller
+            return r.content
 
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        task_id = data.get("task_id") or ""
+        data = resp.get("data", {}) or {}
         status = data.get("status") or ""
-
-        # If instant completed
         if status == "completed":
-            output = data.get("output", {}) or {}
-            # always prefer raw b64; higher quality than ephemeral URL
-            if output.get("image_b64"):
-                return base64.b64decode(output["image_b64"])
-            urls = output.get("image_urls") or []
+            out = data.get("output", {}) or {}
+            if out.get("image_b64"):
+                return base64.b64decode(out["image_b64"])
+            urls = out.get("image_urls") or []
             if urls:
-                clean_url = urls[0]
-                if "img.theapi.app/ephemeral" in clean_url:
-                    logger.warning("[%s] Ephemeral CDN image detected; quality may be reduced. URL: %s", repr(template_meta), clean_url)
-                resp_get = await client.get(clean_url)
+                # return the raw bytes from first url
+                resp_get = await client.get(urls[0])
                 resp_get.raise_for_status()
                 return resp_get.content
-            raise HTTPException(status_code=502, detail="Gemini returned completed status but no image found")
+            # completed but no image -> raise
+            raise HTTPException(status_code=502, detail="Gemini completed but returned no image")
 
-        # Otherwise poll task endpoint
+        # otherwise we will poll for task_id
+        task_id = data.get("task_id") or ""
         if not task_id:
-            logger.error("No task_id returned by Gemini POST: %s", resp)
             raise HTTPException(status_code=502, detail="Gemini did not return task_id")
 
         task_status_url = TEXT_PIAPI_URL.rstrip("/") + f"/{task_id}"
@@ -317,30 +268,24 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
             try:
                 r2 = await client.get(task_status_url, headers=headers)
             except Exception as e:
-                logger.warning("[%s] Poll attempt %d failed to reach Gemini: %s", task_id, attempt + 1, e)
+                logger.warning("[%s] Poll attempt %d failed: %s", task_id, attempt + 1, e)
                 continue
-
-            text2 = (r2.text or "").lower()
-            if r2.status_code in (400, 402) and "credit" in text2:
-                logger.error("[%s] Credits exhausted while polling: %s", task_id, (r2.text or "")[:400])
-                raise HTTPException(status_code=402, detail="Nano Banana credits exhausted during processing")
 
             if r2.status_code >= 500:
-                # transient poll error -> log and continue; do not fail job immediately
                 logger.warning("[%s] Gemini poll returned %s; attempt %d/%d", task_id, r2.status_code, attempt + 1, max_attempts)
                 continue
-
             if r2.status_code >= 400:
-                logger.error("[%s] Gemini poll returned %s: %s", task_id, r2.status_code, (r2.text or "")[:800])
                 raise HTTPException(status_code=502, detail=f"Gemini poll error: {r2.status_code}")
 
             try:
                 jr = r2.json()
-            except Exception as e:
-                logger.warning("[%s] Failed parsing Gemini poll JSON (attempt %d): %s", task_id, attempt + 1, e)
+            except Exception:
+                # If poll response is not JSON, check raw content
+                if r2.content:
+                    return r2.content
                 continue
 
-            d = jr.get("data", {}) if isinstance(jr, dict) else {}
+            d = jr.get("data", {}) or {}
             st = d.get("status", "")
             if st == "completed":
                 out = d.get("output", {}) or {}
@@ -348,53 +293,21 @@ async def call_text_piapi_image_swap(image_bytes: bytes, kidinfo: dict, template
                     return base64.b64decode(out["image_b64"])
                 urls = out.get("image_urls") or []
                 if urls:
-                    clean_url = urls[0]
-                    if "img.theapi.app/ephemeral" in clean_url:
-                        logger.warning("[%s] Ephemeral CDN image detected; quality may be reduced. URL: %s", task_id, clean_url)
-                    resp_get = await client.get(clean_url)
+                    resp_get = await client.get(urls[0])
                     resp_get.raise_for_status()
                     return resp_get.content
                 raise HTTPException(status_code=502, detail="Gemini completed but returned no image")
             if st in ("failed", "error"):
-                logger.error("[%s] Gemini task failed: %s", task_id, jr)
                 raise HTTPException(status_code=502, detail="Gemini processing failed")
 
-            if attempt % 5 == 0:
-                logger.info("[%s] Gemini still pending (attempt %d/%d)", task_id, attempt + 1, max_attempts)
-
-        logger.error("[%s] Gemini task did not complete within %s seconds", task_id, max_poll_seconds)
         raise HTTPException(status_code=504, detail="Gemini processing timed out")
 
 
 async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
     """
     Call PIAPI (Image-Toolkit) to do face swapping on a single image.
-    Model used: Qubico/image-toolkit
-    - Uses follow_redirects=True
-    - Retries 5xx transient errors
-    - Prefers image_b64 in response for full quality; falls back to output_url
-    - Falls back to DZINE_URL if configured; final degraded fallback returns original bytes
+    Returns raw bytes; caller will validate.
     """
-    import asyncio
-
-    # small helper to try to parse json and prefer image_b64
-    async def _parse_image_response(resp_obj: httpx.Response, client: httpx.AsyncClient):
-        try:
-            j = resp_obj.json()
-        except Exception:
-            return resp_obj.content
-        if isinstance(j, dict):
-            if j.get("image_b64"):
-                return base64.b64decode(j["image_b64"])
-            if j.get("output_url"):
-                url = j.get("output_url")
-                if "img.theapi.app/ephemeral" in url:
-                    logger.warning("[face-swap] Ephemeral CDN image detected; quality may be reduced. URL: %s", url)
-                r_get = await client.get(url)
-                r_get.raise_for_status()
-                return r_get.content
-        return resp_obj.content
-
     if PIAPI_URL:
         headers = {"Authorization": f"Bearer {PIAPI_KEY}"} if PIAPI_KEY else {}
         data = {
@@ -409,84 +322,146 @@ async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeo
             try:
                 r = await client.post(PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
             except Exception as e:
-                logger.exception("[face-swap] Failed to reach PIAPI image-toolkit: %s", e)
-                r = None
+                logger.warning("[face-swap] Failed to reach PIAPI image-toolkit: %s", e)
+                raise HTTPException(status_code=502, detail="PIAPI not reachable")
 
-            # retry transient 5xx up to 2 times
-            if r is not None:
-                for attempt in range(2):
-                    if r.status_code >= 500:
-                        logger.warning("[face-swap] PIAPI returned %s, retry %d/2 ...", r.status_code, attempt + 1)
-                        await asyncio.sleep(1.5 * (attempt + 1))
-                        try:
-                            r = await client.post(PIAPI_URL, headers=headers, data={"payload": json.dumps(data)}, files=files)
-                        except Exception as e:
-                            logger.warning("[face-swap] retry failed: %s", e)
-                            r = None
-                            break
-                    else:
-                        break
+            if r.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"PIAPI returned {r.status_code}")
 
-            if r is None or (r.status_code >= 500):
-                # fallback to DZINE if present
-                if DZINE_URL:
-                    logger.info("[face-swap] Falling back to DZINE_URL for face-swap")
-                    try:
-                        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as dz_client:
-                            dz_files = {"file": ("page.png", image_bytes, "image/png")}
-                            dz_data = {"meta": json.dumps(face_meta or {})}
-                            dz_r = await dz_client.post(DZINE_URL, headers={}, data=dz_data, files=dz_files)
-                            if dz_r.status_code < 400:
-                                return await _parse_image_response(dz_r, dz_client)
-                    except Exception as e:
-                        logger.exception("[face-swap] DZINE fallback failed: %s", e)
-
-                # degraded fallback: return identity (no face swap)
-                logger.error("[face-swap] Both PIAPI and fallback failed; returning original image bytes.")
-                return image_bytes
-
-            # success path: parse result and prefer image_b64
-            try:
-                return await _parse_image_response(r, client)
-            except Exception as e:
-                logger.exception("[face-swap] Failed parsing response, returning raw content: %s", e)
-                return r.content
-
-    # fallback to DZINE_URL if configured
-    if DZINE_URL:
-        headers = {}
-        files = {"file": ("page.png", image_bytes, "image/png")}
-        data = {"meta": json.dumps(face_meta or {})}
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.post(DZINE_URL, headers=headers, data=data, files=files)
-            r.raise_for_status()
+            # try to parse json and prefer image_b64
             try:
                 j = r.json()
-                if j.get("image_b64"):
-                    return base64.b64decode(j["image_b64"])
-                if j.get("output_url"):
-                    resp = await client.get(j["output_url"])
-                    resp.raise_for_status()
-                    return resp.content
+                if isinstance(j, dict):
+                    if j.get("image_b64"):
+                        return base64.b64decode(j["image_b64"])
+                    if j.get("output_url"):
+                        resp = await client.get(j["output_url"])
+                        resp.raise_for_status()
+                        return resp.content
             except Exception:
-                return r.content
+                pass
+            return r.content
 
-    # identity (no face-swap configured)
+    # If PIAPI_URL not configured, raise so caller can fallback to DZINE
+    raise HTTPException(status_code=502, detail="PIAPI_URL not configured")
+
+
+# ---------- safety wrappers (validate + retry + fallback) ----------
+async def safe_text_swap(tpl_bytes: bytes, kidinfo: dict, template_meta: dict = None, timeout: int = 120) -> bytes:
+    """
+    Robust wrapper:
+      - try call_text_piapi_image_swap up to 3 times
+      - validate bytes are real images
+      - if still invalid and DZINE_URL present, try Dzine once
+      - final degraded fallback: return original template bytes
+    """
+    # Try primary PiAPI up to 3 times
+    for attempt in range(3):
+        try:
+            logger.info("[%s] text-swap attempt %d/3", repr(template_meta), attempt + 1)
+            out = await call_text_piapi_image_swap(tpl_bytes, kidinfo, template_meta=template_meta, timeout=timeout)
+            if out and is_valid_image_bytes(out):
+                return out
+            logger.warning("[%s] text-swap returned invalid image on attempt %d", repr(template_meta), attempt + 1)
+        except HTTPException as he:
+            logger.warning("[%s] text-swap HTTP error on attempt %d: %s", repr(template_meta), attempt + 1, he.detail)
+        except Exception as e:
+            logger.warning("[%s] text-swap exception on attempt %d: %s", repr(template_meta), attempt + 1, e)
+        await asyncio_sleep_backoff(attempt)
+
+    # Try DZINE fallback (if configured)
+    if DZINE_URL:
+        try:
+            logger.info("[%s] Trying DZINE fallback for text-swap", repr(template_meta))
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                files = {"file": ("page.png", tpl_bytes, "image/png")}
+                data = {"meta": json.dumps({"prompt": f"Replace name with {kidinfo.get('kid_name', 'child')}", "num_images": 1})}
+                dz_r = await client.post(DZINE_URL, data=data, files=files)
+                if dz_r.status_code < 400:
+                    # try parse json
+                    try:
+                        j = dz_r.json()
+                        if isinstance(j, dict) and j.get("image_b64"):
+                            out = base64.b64decode(j["image_b64"])
+                            if is_valid_image_bytes(out):
+                                return out
+                        if isinstance(j, dict) and j.get("output_url"):
+                            resp = await client.get(j["output_url"])
+                            resp.raise_for_status()
+                            if is_valid_image_bytes(resp.content):
+                                return resp.content
+                    except Exception:
+                        # maybe raw bytes
+                        if is_valid_image_bytes(dz_r.content):
+                            return dz_r.content
+                else:
+                    logger.warning("[%s] DZINE fallback returned status %s", repr(template_meta), dz_r.status_code)
+        except Exception as e:
+            logger.exception("[%s] DZINE fallback failed: %s", repr(template_meta), e)
+
+    # Last resort: log and return original template bytes (degraded path)
+    logger.error("[%s] Both TEXT_PIAPI and fallback failed; returning original template bytes.", repr(template_meta))
+    return tpl_bytes
+
+async def safe_face_swap(image_bytes: bytes, face_meta: dict = None, timeout: int = 180) -> bytes:
+    """
+    Robust wrapper for face-swap:
+      - try PIAPI face-swap upto 2 times
+      - validate bytes
+      - fallback to DZINE if configured
+      - final: return original bytes
+    """
+    # Try PIAPI attempts
+    for attempt in range(2):
+        try:
+            logger.info("[face-swap] attempt %d/2 for %s", attempt + 1, repr(face_meta))
+            out = await call_face_piapi_swap(image_bytes, face_meta=face_meta, timeout=timeout)
+            if out and is_valid_image_bytes(out):
+                return out
+            logger.warning("[face-swap] returned invalid image on attempt %d for %s", attempt + 1, repr(face_meta))
+        except HTTPException as he:
+            logger.warning("[face-swap] HTTP error attempt %d: %s", attempt + 1, he.detail)
+        except Exception as e:
+            logger.warning("[face-swap] Exception attempt %d: %s", attempt + 1, e)
+        await asyncio_sleep_backoff(attempt)
+
+    # DZINE fallback
+    if DZINE_URL:
+        try:
+            logger.info("[face-swap] Trying DZINE fallback for face-swap %s", repr(face_meta))
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                files = {"file": ("page.png", image_bytes, "image/png")}
+                data = {"meta": json.dumps(face_meta or {})}
+                dz_r = await client.post(DZINE_URL, data=data, files=files)
+                if dz_r.status_code < 400:
+                    try:
+                        j = dz_r.json()
+                        if isinstance(j, dict) and j.get("image_b64"):
+                            out = base64.b64decode(j["image_b64"])
+                            if is_valid_image_bytes(out):
+                                return out
+                        if isinstance(j, dict) and j.get("output_url"):
+                            resp = await client.get(j["output_url"])
+                            resp.raise_for_status()
+                            if is_valid_image_bytes(resp.content):
+                                return resp.content
+                    except Exception:
+                        if is_valid_image_bytes(dz_r.content):
+                            return dz_r.content
+                else:
+                    logger.warning("[face-swap] DZINE returned %s", dz_r.status_code)
+        except Exception as e:
+            logger.exception("[face-swap] DZINE fallback failed: %s", e)
+
+    logger.error("[face-swap] Both PIAPI and fallback failed; returning original image bytes.")
     return image_bytes
 
+async def asyncio_sleep_backoff(attempt: int):
+    """Simple async backoff helper."""
+    import asyncio
+    await asyncio.sleep(1.0 * (attempt + 1))
+
 # ---------- endpoints ----------
-
-import httpx, json
-
-@app.get("/test-piapi")
-async def test_piapi():
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get("https://api.piapi.ai/api/v1/task")
-            return {"status": r.status_code, "text": r.text[:200]}
-    except Exception as e:
-        return {"error": str(e)}
-
 @app.post("/get-presigned-upload", response_model=PresignResp)
 async def get_presigned_upload(req: PresignRequest):
     if s3 is None:
@@ -510,6 +485,7 @@ async def generate_story(
     """
     Accepts kid image + kid_name + story_choice + gender.
     Uploads kid image to uploads bucket, constructs kidinfo, and starts pipeline.
+    Returns job_id immediately. Frontend should poll /job-status/{job_id}.
     """
     if s3 is None:
         raise HTTPException(status_code=500, detail="Server storage not configured")
@@ -540,8 +516,16 @@ async def generate_story(
         "kid_image_r2": {"bucket": CF_R2_BUCKET_UPLOADS, "r2_key": upload_key}
     }
 
-    # create job record
-    _jobs[job_id] = {"status": "processing", "created_at": datetime.utcnow().isoformat(), "error": None, "r2_key": None}
+    # create job record with preview fields
+    _jobs[job_id] = {
+        "status": "processing",
+        "created_at": datetime.utcnow().isoformat(),
+        "error": None,
+        "r2_key": None,
+        "preview_ready": False,
+        "preview_urls": [],
+        "pages_total": 0
+    }
 
     # start background pipeline
     background_tasks.add_task(_process_pipeline, job_id, upload_key, kidinfo, story_choice, gender)
@@ -553,29 +537,38 @@ async def job_status(job_id: str):
     data = _jobs.get(job_id)
     if not data:
         raise HTTPException(status_code=404, detail="job_id not found")
+    result = {"job_id": job_id, "status": data.get("status", "processing"), "error": data.get("error")}
+    result["preview_ready"] = data.get("preview_ready", False)
+    result["preview_urls"] = data.get("preview_urls", [])
     if data.get("status") == "completed" and data.get("r2_key"):
         try:
             download_url = generate_presigned_get(CF_R2_BUCKET_OUTPUTS, data["r2_key"])
         except Exception:
             download_url = None
-        return {"job_id": job_id, "status": "completed", "download_url": download_url, "r2_key": data.get("r2_key")}
-    return {"job_id": job_id, "status": data.get("status", "processing"), "error": data.get("error")}
+        result.update({"download_url": download_url, "r2_key": data.get("r2_key")})
+    return result
 
 @app.get("/health")
 async def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()}
 
-# ---------- background pipeline (two-phase: text then face) ----------
+@app.get("/test-piapi")
+async def test_piapi():
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get("https://api.piapi.ai/api/v1/task")
+            return {"status": r.status_code, "text": (r.text or "")[:400]}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------- background pipeline (preview-first) ----------
 async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, story_choice: str, gender: str):
     """
     Steps:
-      A) list template images under templates/{story_choice}/{gender}/ (cap to 5)
-         for each: download -> TEXT_PIAPI text-swap
-         store text-swapped bytes locally and (optionally) in outputs/tmp/
-         AFTER all 5 text-swaps, emit checkpoint log line.
-      B) run FACE swap over the 5 text-swapped images
-         upload final pages to outputs/{job_id}/NNN.png
-      C) assemble final PDF once and upload
+      1) list templates (cap to 5)
+      2) text-swap ALL pages but immediately face-swap and publish preview for first 3
+      3) face-swap remaining pages
+      4) upload sequential pages and assemble final PDF
     """
     try:
         prefix = f"{story_choice}/{gender}/"
@@ -601,12 +594,15 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
         # Cap to 5 pages for this checkpoint build
         keys_sorted = keys_sorted[:5]
         logger.info("[%s] using first %d template pages", job_id, len(keys_sorted))
+        _jobs[job_id]["pages_total"] = len(keys_sorted)
 
         tmp_dir = f"/tmp/fictales_{job_id}"
         os.makedirs(tmp_dir, exist_ok=True)
 
-        # ---------- PHASE A: TEXT-SWAP ALL 5 PAGES ----------
-        text_swapped_list: List[tuple[str, bytes]] = []
+        # containers to hold image bytes (final)
+        final_image_bytes: List[Tuple[str, bytes]] = []  # (page_num, bytes)
+
+        # ---------- PHASE A: TEXT-SWAP for all pages, face-swap immediately for first 3 ----------
         for idx, tpl_key in enumerate(keys_sorted, start=1):
             logger.info("[%s] [TEXT] downloading template %s", job_id, tpl_key)
             try:
@@ -616,23 +612,20 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
                 _jobs[job_id].update(status="failed", error=f"Failed downloading template {tpl_key}")
                 return
 
+            # robust text-swap -> validated image bytes
             try:
-                text_swapped_bytes = await call_text_piapi_image_swap(
-                    tpl_bytes, kidinfo, template_meta={"template_key": tpl_key, "index": idx}
-                )
+                text_swapped_bytes = await safe_text_swap(tpl_bytes, kidinfo, template_meta={"template_key": tpl_key, "index": idx})
             except Exception as e:
-                logger.exception("[%s] TEXT_PIAPI text-swap failed for %s: %s", job_id, tpl_key, e)
-                _jobs[job_id].update(status="failed", error=f"TEXT_PIAPI text-swap failed for {tpl_key}")
-                return
+                logger.exception("[%s] TEXT swap totally failed for %s: %s", job_id, tpl_key, e)
+                # final degraded path: use original template as text-swap
+                text_swapped_bytes = tpl_bytes
 
             page_num = str(idx).zfill(3)
-            # Save interim text-swapped file locally (and optionally to R2 tmp path)
+
+            # Save interim text-swapped locally & upload (debug)
             text_local_path = os.path.join(tmp_dir, f"text_{page_num}.png")
             with open(text_local_path, "wb") as f:
                 f.write(text_swapped_bytes)
-            text_swapped_list.append((page_num, text_swapped_bytes))
-
-            # Optional: upload interim text-swapped page (helps debugging)
             try:
                 tmp_r2_key = f"outputs/{job_id}/_textswap/{page_num}.png"
                 s3_put_bytes(CF_R2_BUCKET_OUTPUTS, tmp_r2_key, text_swapped_bytes, content_type="image/png")
@@ -640,48 +633,122 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
             except Exception as e:
                 logger.warning("[%s] failed uploading interim text page (non-fatal): %s", job_id, e)
 
-        # >>>>>>> REQUIRED CHECKPOINT LOG <<<<<<<
-        logger.info('done with all 5 page text swaps, moving on to face swaps now, pls wait')
+            # For first 3 pages, do face-swap immediately to produce preview-ready images
+            if idx <= 3:
+                try:
+                    face_bytes = await safe_face_swap(text_swapped_bytes, face_meta={"kidinfo_key": kidinfo_r2_key, "index": idx})
+                except Exception as e:
+                    logger.exception("[%s] face-swap failed for preview page %s: %s", job_id, page_num, e)
+                    face_bytes = text_swapped_bytes  # degraded
 
-        # ---------- PHASE B: FACE-SWAP OVER TEXT-SWAPPED RESULTS ----------
-        final_image_paths: List[str] = []
-        for page_num, text_swapped_bytes in text_swapped_list:
-            idx = int(page_num)
+                # Validate final preview bytes
+                if not is_valid_image_bytes(face_bytes):
+                    logger.warning("[%s] preview page %s result invalid, using text-swapped bytes", job_id, page_num)
+                    face_bytes = text_swapped_bytes
+
+                # write preview local & upload preview to R2
+                preview_local = os.path.join(tmp_dir, f"preview_{page_num}.png")
+                with open(preview_local, "wb") as f:
+                    f.write(face_bytes)
+
+                preview_r2_key = f"outputs/{job_id}/preview/{page_num}.png"
+                try:
+                    s3_put_bytes(CF_R2_BUCKET_OUTPUTS, preview_r2_key, face_bytes, content_type="image/png")
+                    logger.info("[%s] uploaded preview page -> %s", job_id, preview_r2_key)
+                except Exception as e:
+                    logger.warning("[%s] failed uploading preview page (non-fatal): %s", job_id, e)
+
+                # Also save to final_image_bytes for PDF assembling
+                final_image_bytes.append((page_num, face_bytes))
+
+                # If we have first 3 previews, set preview_ready and store presigned URLs
+                if idx == 3:
+                    # generate presigned urls for the three preview images (if s3 configured)
+                    preview_urls = []
+                    try:
+                        for j in range(1, 4):
+                            key_j = f"outputs/{job_id}/preview/{str(j).zfill(3)}.png"
+                            url = generate_presigned_get(CF_R2_BUCKET_OUTPUTS, key_j)
+                            preview_urls.append(url)
+                    except Exception as e:
+                        logger.warning("[%s] failed generating preview presigned URLs: %s", job_id, e)
+                    _jobs[job_id].update(preview_ready=True, preview_urls=preview_urls)
+                    logger.info("[%s] First 3 pages ready — preview available.", job_id)
+            else:
+                # For pages > 3, store text-swapped bytes to be face-swapped in PHASE B
+                final_image_bytes.append((page_num, text_swapped_bytes))
+
+        # At this point: first 3 final_image_bytes are fully face-swapped,
+        # remaining items may be text-swapped (need face-swap pass)
+        # >>>>>>> REQUIRED CHECKPOINT LOG <<<<<<<
+        logger.info("[%s] done with text-swap pass, proceeding to face-swap remaining pages", job_id)
+
+        # ---------- PHASE B: FACE-SWAP remaining pages (pages > 3) ----------
+        completed_final = []
+        for page_num, img_bytes in final_image_bytes:
+            # skip those already face-swapped (pages 001-003 we treated as final)
+            if int(page_num) <= 3:
+                completed_final.append((page_num, img_bytes))
+                continue
+
             try:
-                face_swapped_bytes = await call_face_piapi_swap(
-                    text_swapped_bytes,
-                    face_meta={"kidinfo_key": kidinfo_r2_key, "index": idx}
-                )
+                face_bytes = await safe_face_swap(img_bytes, face_meta={"kidinfo_key": kidinfo_r2_key, "index": int(page_num)})
             except Exception as e:
                 logger.exception("[%s] face-swap failed for page %s: %s", job_id, page_num, e)
-                _jobs[job_id].update(status="failed", error=f"Face-swap failed for page {page_num}")
-                return
+                face_bytes = img_bytes  # degraded
 
+            # validate
+            if not is_valid_image_bytes(face_bytes):
+                logger.warning("[%s] final page %s invalid after face-swap; using text-swapped bytes", job_id, page_num)
+                face_bytes = img_bytes
+
+            # write local and upload final page
             local_path = os.path.join(tmp_dir, f"{page_num}.png")
             with open(local_path, "wb") as f:
-                f.write(face_swapped_bytes)
-            final_image_paths.append(local_path)
-
+                f.write(face_bytes)
             r2_out_key = f"outputs/{job_id}/{page_num}.png"
             try:
-                s3_put_bytes(CF_R2_BUCKET_OUTPUTS, r2_out_key, face_swapped_bytes, content_type="image/png")
+                s3_put_bytes(CF_R2_BUCKET_OUTPUTS, r2_out_key, face_bytes, content_type="image/png")
                 logger.info("[%s] uploaded final page -> %s", job_id, r2_out_key)
             except Exception as e:
                 logger.exception("[%s] failed uploading page to outputs: %s", job_id, e)
                 _jobs[job_id].update(status="failed", error="Failed uploading page image to outputs")
                 return
 
+            completed_final.append((page_num, face_bytes))
+
+        # Make sure we included the previewed pages in uploads (some were already uploaded as preview)
+        # Upload any previewed pages to final path too (ensure consistent outputs)
+        for page_num, img_bytes in completed_final:
+            # if preview pages (<=3), also ensure outputs/{job_id}/NNN.png exist
+            r2_out_key = f"outputs/{job_id}/{page_num}.png"
+            try:
+                s3_put_bytes(CF_R2_BUCKET_OUTPUTS, r2_out_key, img_bytes, content_type="image/png")
+            except Exception as e:
+                logger.warning("[%s] failed ensuring final upload for %s: %s", job_id, r2_out_key, e)
+
         # ---------- PHASE C: ASSEMBLE PDF ONCE ----------
         pdf_path = os.path.join(tmp_dir, f"{job_id}.pdf")
         try:
             images = []
-            for p in final_image_paths:
-                img = Image.open(p)
-                if img.mode in ("RGBA", "LA") or (img.mode == "P"):
-                    img = img.convert("RGB")
-                images.append(img)
+            # sort completed_final by page number ascending
+            completed_final_sorted = sorted(completed_final, key=lambda t: int(t[0]))
+            for pnum, bytes_img in completed_final_sorted:
+                try:
+                    img = Image.open(BytesIO(bytes_img))
+                    # convert if necessary
+                    if img.mode in ("RGBA", "LA") or (img.mode == "P"):
+                        img = img.convert("RGB")
+                    images.append(img.copy())
+                    img.close()
+                except UnidentifiedImageError as ui:
+                    logger.error("[%s] PIL failed to open page %s: %s", job_id, pnum, ui)
+                except Exception as e:
+                    logger.exception("[%s] unexpected error opening page %s: %s", job_id, pnum, e)
+
             if not images:
-                raise RuntimeError("No images to assemble")
+                raise RuntimeError("No valid images to assemble into PDF")
+
             first, rest = images[0], images[1:]
             first.save(pdf_path, "PDF", resolution=150.0, save_all=True, append_images=rest)
             logger.info("[%s] assembled PDF -> %s", job_id, pdf_path)
@@ -711,5 +778,5 @@ async def _process_pipeline(job_id: str, kidinfo_r2_key: str, kidinfo: dict, sto
 if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
+    # Railway likes 8080; use the environment PORT when available
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
-
