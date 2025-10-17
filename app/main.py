@@ -475,6 +475,18 @@ async def call_face_piapi_swap(image_bytes: bytes, face_meta: dict = None, timeo
     return image_bytes
 
 # ---------- endpoints ----------
+
+import httpx, json
+
+@app.get("/test-piapi")
+async def test_piapi():
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get("https://api.piapi.ai/api/v1/task")
+            return {"status": r.status_code, "text": r.text[:200]}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/get-presigned-upload", response_model=PresignResp)
 async def get_presigned_upload(req: PresignRequest):
     if s3 is None:
@@ -700,3 +712,4 @@ if __name__ == "__main__":
     import uvicorn, os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
+
